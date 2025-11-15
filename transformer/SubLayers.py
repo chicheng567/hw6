@@ -90,14 +90,13 @@ class MultiHeadSelfAttention_Flash(nn.Module):
         return output
 
 class MultiHeadCrossAttention_Flash(nn.Module):
-    def __init__(self, n_head, d_model, d_q, d_kv, dropout=0.1, causal=False):
+    def __init__(self, n_head, d_model, d_qkv, dropout=0.1, causal=False):
         super().__init__()
         self.n_head = n_head
-        self.d_q = d_q
-        self.d_kv = d_kv
-        self.w_q = nn.Linear(d_model, n_head * d_q, bias=False)
-        self.w_kv = nn.Linear(d_model, n_head * d_kv * 2, bias=False)
-        self.w_o = nn.Linear(n_head * d_kv, d_model, bias=False)
+        self.d_qkv = d_qkv
+        self.w_q = nn.Linear(d_model, n_head * d_qkv, bias=False)
+        self.w_kv = nn.Linear(d_model, n_head * d_qkv * 2, bias=False)
+        self.w_o = nn.Linear(n_head * d_qkv, d_model, bias=False)
         self.dropout_layer = nn.Dropout(dropout)
         self.dropout_rate = dropout
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)

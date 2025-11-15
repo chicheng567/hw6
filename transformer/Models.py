@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from transformer.Layers import EncoderLayer, DecoderLayer
+from transformer.Layers import EncoderLayer, DecoderLayer, DecoderLayer_Flash
 
 
 __author__ = "Yu-Hsiang Huang"
@@ -83,47 +83,61 @@ class Encoder(nn.Module):
             return enc_output, enc_slf_attn_list
         return enc_output,
 
-
 class Decoder(nn.Module):
     ''' A decoder model with self attention mechanism. '''
 
     def __init__(
             self, n_trg_vocab, d_word_vec, n_layers, n_head, d_k, d_v,
-            d_model, d_inner, pad_idx, n_position=200, dropout=0.1, scale_emb=False):
+            d_model, d_inner, pad_idx, n_position=200, dropout=0.1, scale_emb=False, flash_attn=False):
 
         super().__init__()
 
         self.trg_word_emb = nn.Embedding(n_trg_vocab, d_word_vec, padding_idx=pad_idx)
         self.position_enc = PositionalEncoding(d_word_vec, n_position=n_position)
         self.dropout = nn.Dropout(p=dropout)
-        self.layer_stack = nn.ModuleList([
-            DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
-            for _ in range(n_layers)])
+        self.flash_attn = flash_attn
+        if flash_attn:
+            assert d_k == d_v, "For Flash Attention, d_k must be equal to d_v"
+            self.layer_stack = nn.ModuleList([
+                DecoderLayer_Flash(d_model, d_inner, n_head, d_k, dropout=dropout)
+                for _ in range(n_layers)])
+        else:
+            self.layer_stack = nn.ModuleList([
+                DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
+                for _ in range(n_layers)])
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
         self.scale_emb = scale_emb
         self.d_model = d_model
 
     def forward(self, trg_seq, trg_mask, enc_output, src_mask, return_attns=False):
-
-        dec_slf_attn_list, dec_enc_attn_list = [], []
-
-        # -- Forward
         dec_output = self.trg_word_emb(trg_seq)
         if self.scale_emb:
             dec_output *= self.d_model ** 0.5
         dec_output = self.dropout(self.position_enc(dec_output))
         dec_output = self.layer_norm(dec_output)
+        if self.flash_attn:
+            # IF flash attention is used, trg_mask and src_mask are actually sequence lengths with shape (batch_size,)
+            # so we handle them differently.
+            # And we assume under flash attention mode, sequence packing is used.
+            # So trg_seq and enc_output are already packed sequences with shape (total_seq_len, d_model)
+            trg_seq_len = trg_mask
+            enc_seq_len = src_mask
+            for dec_layer in self.layer_stack:
+                dec_output = dec_layer(dec_output, trg_seq_len, enc_output, enc_seq_len)
+        else:
+            #In normal attention case, trg_mask and src_mask are boolean masks.
+            #trg_mask is causal mask combined with padding mask for target sequence.
+            #src_mask is padding mask for source sequence.
+            dec_slf_attn_list, dec_enc_attn_list = [], []
+            for dec_layer in self.layer_stack:
+                dec_output, dec_slf_attn, dec_enc_attn = dec_layer(
+                    dec_output, enc_output, slf_attn_mask=trg_mask, dec_enc_attn_mask=src_mask)
+                dec_slf_attn_list += [dec_slf_attn] if return_attns else []
+                dec_enc_attn_list += [dec_enc_attn] if return_attns else []
 
-        for dec_layer in self.layer_stack:
-            dec_output, dec_slf_attn, dec_enc_attn = dec_layer(
-                dec_output, enc_output, slf_attn_mask=trg_mask, dec_enc_attn_mask=src_mask)
-            dec_slf_attn_list += [dec_slf_attn] if return_attns else []
-            dec_enc_attn_list += [dec_enc_attn] if return_attns else []
-
-        if return_attns:
-            return dec_output, dec_slf_attn_list, dec_enc_attn_list
-        return dec_output,
-
+            if return_attns:
+                return dec_output, dec_slf_attn_list, dec_enc_attn_list
+            return dec_output,
 
 class Transformer(nn.Module):
     ''' A sequence to sequence model with attention mechanism. '''
@@ -183,16 +197,61 @@ class Transformer(nn.Module):
         if emb_src_trg_weight_sharing:
             self.encoder.src_word_emb.weight = self.decoder.trg_word_emb.weight
 
-
     def forward(self, src_seq, trg_seq):
-
         src_mask = get_pad_mask(src_seq, self.src_pad_idx)
         trg_mask = get_pad_mask(trg_seq, self.trg_pad_idx) & get_subsequent_mask(trg_seq)
-
         enc_output, *_ = self.encoder(src_seq, src_mask)
         dec_output, *_ = self.decoder(trg_seq, trg_mask, enc_output, src_mask)
         seq_logit = self.trg_word_prj(dec_output)
         if self.scale_prj:
             seq_logit *= self.d_model ** -0.5
-
         return seq_logit.view(-1, seq_logit.size(2))
+
+from transformers import ModernBertModel, AutoTokenizer
+class Seq2SeqModelWithFlashAttn(nn.Module):
+    def __init__(self, transformer_model_path="answerdotai/ModernBERT-base", freeze_encoder=True):
+        super().__init__()
+        self.encoder = ModernBertModel.from_pretrained(transformer_model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(transformer_model_path)
+        self.decoder = Decoder(
+            n_trg_vocab=len(self.tokenizer),
+            d_word_vec=768,
+            n_layers=6,
+            n_head=12,
+            d_k=768 // 12,
+            d_v=768 // 12,
+            d_model=768,
+            d_inner=768 * 4,
+            pad_idx=self.tokenizer.pad_token_id,
+            n_position=70,
+            dropout=0.1,
+            scale_emb=False,
+            flash_attn=True)
+        self.output_projection = nn.Linear(768, len(self.tokenizer), bias=False)
+        # Tie weights
+        self.decoder.trg_word_emb.weight.copy_(
+            self.encoder.embeddings.tok_embeddings.weight
+        )
+        self.output_projection.weight = self.decoder.trg_word_emb.weight
+        if freeze_encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+    def forward(self, src_input_ids, trg_input_ids, src_seq_len, trg_seq_len):
+        # src_input and trg_input are assumed to be already tokenized and sequence packed.
+        # src_input and trg_input shape should be (total_seq_len, )
+        # Encode
+        enc_outputs = self.encoder(
+            input_ids=src_input_ids,
+            attention_mask=(src_input_ids != self.tokenizer.pad_token_id).long()
+        )
+        enc_output = enc_outputs.last_hidden_state
+        # Decode
+        dec_output, = self.decoder(
+            trg_seq=trg_input_ids,
+            trg_mask=trg_seq_len,
+            enc_output=enc_output,
+            src_mask=src_seq_len
+        )
+        # Project to vocabulary
+        logits = self.output_projection(dec_output)
+        return logits
