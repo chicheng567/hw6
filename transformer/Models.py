@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+from typing import Optional
 from transformer.Layers import DecoderLayer_Flash
 from transformer.utils import *
 
@@ -26,8 +27,31 @@ class PositionalEncoding(nn.Module):
 
         return torch.FloatTensor(sinusoid_table).unsqueeze(0)
 
-    def forward(self, x):
-        return x + self.pos_table[:, :x.size(1)].clone().detach()
+    def forward(self, x, seq_lens=None):
+        if seq_lens is None:
+            return x + self.pos_table[:, :x.size(1)].clone().detach()
+
+        seq_lens = seq_lens.to(device=x.device, dtype=torch.long)
+        total_seq_len = int(seq_lens.sum().item())
+        if total_seq_len != x.size(0):
+            raise ValueError(
+                f"Packed sequence length mismatch: got {x.size(0)} tokens, "
+                f"but seq_lens sum to {total_seq_len}."
+            )
+
+        seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+        token_seq_ids = torch.arange(seq_lens.size(0), device=x.device).repeat_interleave(seq_lens)
+        seq_offsets = seq_starts[token_seq_ids]
+        position_ids = torch.arange(total_seq_len, device=x.device) - seq_offsets
+
+        max_pos = int(position_ids.max().item())
+        if max_pos >= self.pos_table.size(1):
+            raise ValueError(
+                f"Requested position {max_pos} exceeds available sinusoid size {self.pos_table.size(1)}."
+            )
+
+        pos_emb = self.pos_table[:, position_ids, :].squeeze(0)
+        return x + pos_emb
     
 class Decoder(nn.Module):
     ''' A decoder model with self attention mechanism. '''
@@ -57,7 +81,11 @@ class Decoder(nn.Module):
         dec_output = self.trg_word_emb(trg_seq)
         if self.scale_emb:
             dec_output *= self.d_model ** 0.5
-        dec_output = self.dropout(self.position_enc(dec_output))
+        if self.flash_attn:
+            dec_output = self.position_enc(dec_output, seq_lens=trg_mask)
+        else:
+            dec_output = self.position_enc(dec_output)
+        dec_output = self.dropout(dec_output)
         dec_output = self.layer_norm(dec_output)
         if self.flash_attn:
             # IF flash attention is used, trg_mask and src_mask are actually sequence lengths with shape (batch_size,)
@@ -68,14 +96,23 @@ class Decoder(nn.Module):
             enc_seq_len = src_mask
             for dec_layer in self.layer_stack:
                 dec_output = dec_layer(dec_output, trg_seq_len, enc_output, enc_seq_len)
+            return dec_output
         else:
             raise NotImplementedError("Only Flash Attention is implemented in this Decoder.")
 from transformers import ModernBertModel, AutoTokenizer
 from transformer.Const import *
 class Seq2SeqModelWithFlashAttn(nn.Module):
-    def __init__(self, transformer_model_path="answerdotai/ModernBERT-base", freeze_encoder=True):
+    def __init__(
+        self,
+        transformer_model_path: str = "answerdotai/ModernBERT-base",
+        freeze_encoder: bool = True,
+        weight_dtype: Optional[torch.dtype] = torch.bfloat16,
+    ):
         super().__init__()
-        self.encoder = ModernBertModel.from_pretrained(transformer_model_path, dtype=torch.bfloat16)
+        encoder_kwargs = {}
+        if weight_dtype is not None:
+            encoder_kwargs["torch_dtype"] = weight_dtype
+        self.encoder = ModernBertModel.from_pretrained(transformer_model_path, **encoder_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(transformer_model_path)
         self.decoder = Decoder(
             n_trg_vocab=len(self.tokenizer),
@@ -92,15 +129,12 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             scale_emb=False,
             flash_attn=True)
         self.output_projection = nn.Linear(768, len(self.tokenizer), bias=False)
-        # Tie weights
-        with torch.no_grad():
-            self.decoder.trg_word_emb.weight.copy_(
-                self.encoder.embeddings.tok_embeddings.weight
-            )
-        self.output_projection.weight = self.decoder.trg_word_emb.weight
+        self._cast_modules_to_dtype(weight_dtype)
+        self._tie_decoder_embeddings()
         if freeze_encoder:
             for param in self.encoder.parameters():
                 param.requires_grad = False
+        self.weight_dtype = weight_dtype
     def forward(self, src_input_ids, trg_input_ids, src_seq_len, trg_seq_len):
         # src_input and trg_input are assumed to be already tokenized and sequence packed.
         # src_input and trg_input shape should be (total_seq_len, )
@@ -118,7 +152,7 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         )
         enc_output = enc_outputs["last_hidden_state"] # shape: (total_src_seq_len, d_model)
         assert enc_output.size(0) == src_input_ids.size(0), (enc_output.size(), src_input_ids.size())
-        dec_output, = self.decoder(
+        dec_output = self.decoder(
             trg_seq=trg_input_ids,
             trg_mask=trg_seq_len,
             enc_output=enc_output,
@@ -127,3 +161,17 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         # Project to vocabulary
         logits = self.output_projection(dec_output)
         return logits
+
+    def _cast_modules_to_dtype(self, dtype: Optional[torch.dtype]) -> None:
+        if dtype is None:
+            return
+        self.encoder.to(dtype=dtype)
+        self.decoder.to(dtype=dtype)
+        self.output_projection.to(dtype=dtype)
+
+    def _tie_decoder_embeddings(self) -> None:
+        with torch.no_grad():
+            self.decoder.trg_word_emb.weight.copy_(
+                self.encoder.embeddings.tok_embeddings.weight
+            )
+        self.output_projection.weight = self.decoder.trg_word_emb.weight

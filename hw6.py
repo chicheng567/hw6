@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from transformers import get_linear_schedule_with_warmup
+from tqdm.auto import tqdm
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformer.Const import *
 from transformer.Models import Seq2SeqModelWithFlashAttn
@@ -207,7 +208,8 @@ def run_epoch(
     model.train(train)
     total_loss = 0.0
     steps = 0
-    for batch in dataloader:
+    iterator = tqdm(dataloader, desc="train" if train else "eval", leave=False)
+    for batch in iterator:
         src = batch["src"].to(device)
         tgt = batch["tgt"].to(device)
         src_seq_len = batch["src_len"].to(device=device, dtype=torch.int32)
@@ -245,6 +247,7 @@ def run_epoch(
                 scheduler.step()
         total_loss += loss.item()
         steps += 1
+        iterator.set_postfix(loss=total_loss / max(1, steps))
     return total_loss / max(1, steps)
 
 def load_checkpoint(
@@ -261,9 +264,9 @@ def main() -> None:
     lr = 5e-5
     weight_decay = 0.01
     warmup_steps = 500
-    epochs = 3
+    epochs = 10
     max_grad_norm = 1.0
-    batch_size = 8
+    batch_size = 40
     num_workers = 4
     #####################################
     mode = "train"
@@ -296,9 +299,9 @@ def main() -> None:
         train_loader = build_dataloader(
             train_set,
             tokenizer,
-            batch_size=8,
+            batch_size=batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=num_workers,
         )
         val_set = build_dataset(
             ["dataset/tifu/tifu_val.jsonl", "dataset/samsun/validation.csv"],
@@ -307,9 +310,9 @@ def main() -> None:
         valid_loader = build_dataloader(
             val_set,
             tokenizer,
-            batch_size=8,
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=num_workers,
         )
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=lr, weight_decay=weight_decay

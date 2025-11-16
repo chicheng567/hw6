@@ -53,8 +53,8 @@ class MultiHeadCrossAttention_Flash(nn.Module):
         # seq_lens_kv should be of shape (batch_size,) like (4, 3, 2, 23, 1, ...)
         drop_rate = self.dropout_rate if self.training else 0.0
         residual = x_q
-        q = self.w_q(x_q).view(-1, self.n_head, self.d_q)
-        kv = self.w_kv(x_kv).view(-1, 2, self.n_head, self.d_kv)
+        q = self.w_q(x_q).view(-1, self.n_head, self.d_qkv)
+        kv = self.w_kv(x_kv).view(-1, 2, self.n_head, self.d_qkv)
         k = kv[:,0,:,:]
         v = kv[:,1,:,:]
         cu_seqlens_q = seqlen2cu_len(seq_lens_q)
@@ -67,13 +67,13 @@ class MultiHeadCrossAttention_Flash(nn.Module):
             k,
             v,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
+            cu_seqlens_k=cu_seqlens_kv,
             max_seqlen_q=max_len_q,
-            max_seqlen_kv=max_len_kv,
+            max_seqlen_k=max_len_kv,
             dropout_p=drop_rate,
             causal=self.causal,
         )
-        output = output.reshape(-1, self.n_head * self.d_kv)
+        output = output.reshape(-1, self.n_head * self.d_qkv)
         output = self.dropout_layer(self.w_o(output))
         output += residual
         output = self.layer_norm(output)
