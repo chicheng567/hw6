@@ -4,3 +4,6 @@ EOS = "[SEP]"
 MASK = "[MASK]"
 PAD = "[PAD]"
 UNK = "[UNK]"
+
+# Combined ModernBERT tokenized sequence lengths (train + val, Samsun + TIFU).
+COMBINED_MAX_TARGET_LEN = 524
