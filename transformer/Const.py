@@ -5,5 +5,7 @@ MASK = "[MASK]"
 PAD = "[PAD]"
 UNK = "[UNK]"
 
-# Combined ModernBERT tokenized sequence lengths (train + val, Samsun + TIFU).
-COMBINED_MAX_TARGET_LEN = 524
+MAX_SOURCE_LEN = 8000
+MAX_TARGET_LEN = 512
+
+MAX_BATCH_TOKENS = 8500

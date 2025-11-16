@@ -74,7 +74,7 @@ from transformers import ModernBertModel, AutoTokenizer
 class Seq2SeqModelWithFlashAttn(nn.Module):
     def __init__(self, transformer_model_path="answerdotai/ModernBERT-base", freeze_encoder=True):
         super().__init__()
-        self.encoder = ModernBertModel.from_pretrained(transformer_model_path)
+        self.encoder = ModernBertModel.from_pretrained(transformer_model_path, dtype=torch.bfloat16)
         self.tokenizer = AutoTokenizer.from_pretrained(transformer_model_path)
         self.decoder = Decoder(
             n_trg_vocab=len(self.tokenizer),
@@ -92,9 +92,10 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             flash_attn=True)
         self.output_projection = nn.Linear(768, len(self.tokenizer), bias=False)
         # Tie weights
-        self.decoder.trg_word_emb.weight.copy_(
-            self.encoder.embeddings.tok_embeddings.weight
-        )
+        with torch.no_grad():
+            self.decoder.trg_word_emb.weight.copy_(
+                self.encoder.embeddings.tok_embeddings.weight
+            )
         self.output_projection.weight = self.decoder.trg_word_emb.weight
         if freeze_encoder:
             for param in self.encoder.parameters():

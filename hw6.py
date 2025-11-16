@@ -1,17 +1,16 @@
 import argparse
-import json
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from transformers import get_linear_schedule_with_warmup
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformer.special_tokens import *
+from transformer.Const import *
 from transformer.Models import Seq2SeqModelWithFlashAttn
 from datasets import load_dataset
 
@@ -27,8 +26,8 @@ class SquadSeq2SeqDataset(Dataset):
         self,
         path: Path,
         tokenizer: PreTrainedTokenizerBase,
-        max_source_len: int,
-        max_target_len: int,
+        max_source_len: int = 384,
+        max_target_len: int = 64,
     ) -> None:
         if not path.exists():
             raise FileNotFoundError(f"Dataset not found: {path}")
@@ -38,114 +37,154 @@ class SquadSeq2SeqDataset(Dataset):
         self.max_target_len = max_target_len
         self.bos_token = SOS
         self.eos_token = EOS
-        ds = load_dataset("json", data_files=str(path), split="train")
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            ds = load_dataset("csv", data_files=str(path), split="train")
+        elif suffix in {".json", ".jsonl"}:
+            ds = load_dataset("json", data_files=str(path), split="train")
+        else:
+            raise ValueError(f"Unsupported dataset format: {path}")
         for rec in ds:
-            answers = []
-            if "answers" in rec and rec["answers"] is not None:
-                a = rec["answers"]
-
-            if isinstance(a, dict):
-                answers = a.get("text", []) or []
-            elif isinstance(a, list):
-                # list of strings or list of dicts
-                if a and isinstance(a[0], dict):
-                    for item in a:
-                        if isinstance(item, dict):
-                            txt = item.get("text", [])
-                        if isinstance(txt, list):
-                            answers.extend(txt)
-                        elif txt:
-                            answers.append(txt)
-                    else:
-                        answers = a
-            answer = answers[0] if answers else ""
-            self.samples.append(
-                {
-                    "question": rec.get("question", "") or "",
-                    "context": rec.get("context", "") or "",
-                    "answer": answer,
-                })
+            context = self._extract_field(
+                rec,
+                primary_keys=("context", "dialogue"),
+                instance_keys=("selftext_without_tldr", "context", "article"),
+            )
+            summary = self._extract_field(
+                rec,
+                primary_keys=("summary", "tldr"),
+                instance_keys=("summary", "tldr"),
+            )
+            if not context or not summary:
+                continue
+            self.samples.append({"context": context, "summary": summary})
         if not self.samples:
             raise ValueError(f"No data found in {path}")
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            for item in value:
+                normalized = SquadSeq2SeqDataset._normalize_text(item)
+                if normalized:
+                    return normalized
+        if isinstance(value, dict):
+            # prioritize `text` field if present
+            text = value.get("text")
+            if isinstance(text, str):
+                return text.strip()
+        return ""
+
+    def _extract_field(
+        self,
+        record: Dict[str, Any],
+        primary_keys: Sequence[str],
+        instance_keys: Sequence[str],
+    ) -> str:
+        for key in primary_keys:
+            normalized = self._normalize_text(record.get(key))
+            if normalized:
+                return normalized
+        instance = record.get("instance")
+        if isinstance(instance, dict):
+            for key in instance_keys:
+                normalized = self._normalize_text(instance.get(key))
+                if normalized:
+                    return normalized
+        return ""
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         example = self.samples[idx]
-        encoded = self.tokenizer(
-            example["question"],
-            example["context"],
+        source_text = example["context"]
+        target_text = example["summary"]
+        source_tokens = self.tokenizer.encode(
+            source_text,
+            add_special_tokens=True,
             truncation=True,
-            max_length=self.max_source_len,
-            padding=False,
-            return_attention_mask=True,
+            max_length=self.max_source_len
         )
         target_tokens = self.tokenizer.encode(
-            example["answer"],
-            add_special_tokens=False,
+            target_text,
+            add_special_tokens=True,
             truncation=True,
-            max_length=max(2, self.max_target_len) - 2,
+            max_length=self.max_target_len
         )
-        target_ids = (
-            [self.bos_token_id]
-            + target_tokens
-            + [self.eos_token_id]
-        )
+        
         return {
-            "input_ids": encoded["input_ids"],
-            "attention_mask": encoded["attention_mask"],
-            "target_ids": target_ids,
+            "input_ids": source_tokens,
+            "labels": target_tokens
         }
-
 
 class QACollator:
-    def __init__(self, pad_id: int) -> None:
-        self.pad_id = pad_id
-
-    def _pad_sequences(self, sequences: List[List[int]], pad_value: int) -> torch.Tensor:
-        max_len = max(len(seq) for seq in sequences)
-        tensor = torch.full((len(sequences), max_len), pad_value, dtype=torch.long)
-        for idx, seq in enumerate(sequences):
-            tensor[idx, : len(seq)] = torch.tensor(seq, dtype=torch.long)
-        return tensor
-
     def __call__(self, batch: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
-        input_ids = [item["input_ids"] for item in batch]
-        attention = [item["attention_mask"] for item in batch]
-        target_ids = [item["target_ids"] for item in batch]
+        if not batch:
+            raise ValueError("Empty batch provided to collator.")
+        src_tokens: List[int] = []
+        tgt_tokens: List[int] = []
+        src_lens: List[int] = []
+        tgt_lens: List[int] = []
 
-        max_src = max(len(seq) for seq in input_ids)
-        src_tensor = torch.full((len(batch), max_src), self.pad_id, dtype=torch.long)
-        attn_tensor = torch.zeros((len(batch), max_src), dtype=torch.long)
-        for idx, (seq, mask) in enumerate(zip(input_ids, attention)):
-            seq_len = len(seq)
-            src_tensor[idx, :seq_len] = torch.tensor(seq, dtype=torch.long)
-            attn_tensor[idx, :seq_len] = torch.tensor(mask, dtype=torch.long)
+        for item in batch:
+            src_seq = item["input_ids"]
+            tgt_seq = item["target_ids"]
+            if not src_seq or not tgt_seq:
+                continue
+            src_lens.append(len(src_seq))
+            tgt_lens.append(len(tgt_seq))
+            src_tokens.extend(src_seq)
+            tgt_tokens.extend(tgt_seq)
 
-        tgt_tensor = self._pad_sequences(target_ids, self.pad_id)
+        if not src_tokens or not tgt_tokens:
+            raise ValueError("Batch contains no valid sequences for packing.")
+
         return {
-            "input_ids": src_tensor,
-            "attention_mask": attn_tensor,
-            "target_ids": tgt_tensor,
+            "src": torch.tensor(src_tokens, dtype=torch.long),
+            "tgt": torch.tensor(tgt_tokens, dtype=torch.long),
+            "src_len": torch.tensor(src_lens, dtype=torch.int32),
+            "tgt_len": torch.tensor(tgt_lens, dtype=torch.int32),
         }
-
-
-def build_dataloader(
-    path: Optional[str],
+        
+def build_dataset(path:List[Optional[str]],
     tokenizer: PreTrainedTokenizerBase,
-    max_source_len: int,
-    max_target_len: int,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-) -> Optional[DataLoader]:
-    if path is None:
+) -> Optional[Dataset]:
+    if all(p is None for p in path):
         return None
-    dataset = SquadSeq2SeqDataset(
-        Path(path), tokenizer, max_source_len=max_source_len, max_target_len=max_target_len
-    )
-    collator = QACollator(tokenizer.pad_token_id)
+    datasets = []
+    for p in path:
+        if p is not None:
+            dataset = SquadSeq2SeqDataset(
+                Path(p), tokenizer, max_source_len=MAX_SOURCE_LEN, max_target_len=MAX_TARGET_LEN
+            )
+            datasets.append(dataset)
+    print(f"Built dataset with {sum(len(ds) for ds in datasets)} samples.")
+    print(f"Sample example: {datasets[0][0]}")
+    if len(datasets) == 1:
+        return datasets[0]
+    return ConcatDataset(datasets)
+    
+def build_dataloader(
+    source: Union[Optional[Dataset], Optional[str]],
+    tokenizer: PreTrainedTokenizerBase,
+    max_source_len: int = 384,
+    max_target_len: int = 64,
+    batch_size: int = 4,
+    shuffle: bool = False,
+    num_workers: int = 0,
+) -> Optional[DataLoader]:
+    if source is None:
+        return None
+    if isinstance(source, Dataset):
+        dataset = source
+    else:
+        dataset = SquadSeq2SeqDataset(
+            Path(source), tokenizer, max_source_len=max_source_len, max_target_len=max_target_len
+        )
+    collator = QACollator()
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -169,24 +208,34 @@ def run_epoch(
     total_loss = 0.0
     steps = 0
     for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        target_ids = batch["target_ids"].to(device)
-        decoder_input_ids = target_ids[:, :-1]
-        labels = target_ids[:, 1:]
-        src_seq_len = attention_mask.sum(dim=1).to(dtype=torch.int32)
-        trg_seq_len = (decoder_input_ids != pad_id).sum(dim=1).to(dtype=torch.int32)
+        src = batch["src"].to(device)
+        tgt = batch["tgt"].to(device)
+        src_seq_len = batch["src_len"].to(device=device, dtype=torch.int32)
+        tgt_seq_len = batch["tgt_len"].to(device=device, dtype=torch.int32)
+        if torch.any(tgt_seq_len < 2):
+            raise ValueError("Each target sequence must contain at least BOS and EOS tokens.")
+
+        tgt_len_long = tgt_seq_len.to(dtype=torch.int64)
+        cumulative = torch.cumsum(tgt_len_long, dim=0)
+        start_indices = cumulative - tgt_len_long
+        end_indices = cumulative - 1
+
+        total_tgt_tokens = tgt.size(0)
+        decoder_mask = torch.ones(total_tgt_tokens, dtype=torch.bool, device=device)
+        decoder_mask[end_indices] = False
+        decoder_input_ids = tgt[decoder_mask]
+
+        label_mask = torch.ones(total_tgt_tokens, dtype=torch.bool, device=device)
+        label_mask[start_indices] = False
+        labels = tgt[label_mask]
+        trg_seq_len = (tgt_seq_len - 1).to(dtype=torch.int32)
         logits = model(
-            src_input_ids=input_ids,
+            src_input_ids=src,
             trg_input_ids=decoder_input_ids,
             src_seq_len=src_seq_len,
             trg_seq_len=trg_seq_len,
         )
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=pad_id,
-        )
+        loss = F.cross_entropy(logits, labels, ignore_index=pad_id)
         if train:
             optimizer.zero_grad()
             loss.backward()
@@ -229,70 +278,40 @@ def load_checkpoint(
     model.load_state_dict(state["model_state_dict"])
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ModernBERT encoder + custom decoder trainer")
-    parser.add_argument("--mode", choices=["train", "eval"], default="train")
-    parser.add_argument("--train-path", type=str, default="dataset/train.jsonl")
-    parser.add_argument("--valid-path", type=str, default="dataset/validation.jsonl")
-    parser.add_argument("--pretrained-model", type=str, default="answerdotai/ModernBERT-base")
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-steps", type=int, default=0)
-    parser.add_argument("--max-source-length", type=int, default=384)
-    parser.add_argument("--max-target-length", type=int, default=64)
-    parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--checkpoint-path", type=str, default="checkpoints/bert_decoder.pt")
-    parser.add_argument(
-        "--freeze-encoder",
-        dest="freeze_encoder",
-        action="store_true",
-        help="Freeze ModernBERT encoder weights (default).",
-    )
-    parser.add_argument(
-        "--no-freeze-encoder",
-        dest="freeze_encoder",
-        action="store_false",
-        help="Allow fine-tuning the encoder.",
-    )
-    parser.set_defaults(freeze_encoder=True)
-    parser.add_argument("--device", type=str, default=None, help="Override device string, e.g. cuda:0")
-    return parser.parse_args()
-
-
 def main() -> None:
-    args = parse_args()
-    set_seed(args.seed)
-    if args.device is not None:
-        device = torch.device(args.device)
-        if device.type != "cuda":
-            raise RuntimeError("GPU device is required to run this script.")
-    else:
-        if not torch.cuda.is_available():
-            raise RuntimeError("GPU device is required but not detected. Please run on CUDA hardware.")
+    mode = "train"
+    set_seed(42)
+    if torch.cuda.is_available():
         device = torch.device("cuda")
+    else:
+        raise RuntimeError("CUDA is required to run this code.")
+    
+    # Check if flash attention is available
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError:
+        raise ImportError("flash_attn is required to run this code.")
+    
     model = Seq2SeqModelWithFlashAttn(
-        transformer_model_path=args.pretrained_model,
-        freeze_encoder=args.freeze_encoder,
+        transformer_model_path="answerdotai/ModernBERT-base",
+        freeze_encoder=True,
     ).to(device)
     tokenizer = model.tokenizer
-
-    checkpoint_path = Path(args.checkpoint_path)
-    if checkpoint_path.exists():
+    checkpoint_path = None
+    if checkpoint_path is not None and checkpoint_path.exists():
         load_checkpoint(model, checkpoint_path, device)
 
-    if args.mode == "train":
+    if mode == "train":
+        train_set = build_dataset(
+            ["dataset/tifu/tifu_train.jsonl", "dataset/samsun/train.csv"],
+            tokenizer=model.tokenizer,
+        )
         train_loader = build_dataloader(
-            args.train_path,
+            train_set,
             tokenizer,
-            args.max_source_length,
-            args.max_target_length,
-            args.batch_size,
+            batch_size=8,
             shuffle=True,
-            num_workers=args.num_workers,
+            num_workers=4,
         )
         if train_loader is None:
             raise ValueError("Training requires --train-path")
