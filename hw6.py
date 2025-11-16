@@ -1,8 +1,8 @@
-import argparse
+import csv
 import math
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +17,19 @@ from datasets import load_dataset
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+MODE = "train"  # set to "predict" for inference
+CHECKPOINT_PATH = Path("checkpoints/latest.pt")
+BEST_CHECKPOINT_PATH = Path("checkpoints/best.pt")
+PREDICT_CHECKPOINT = None
+TIFU_TEST_PATH = Path("dataset/tifu/tifu_test.jsonl")
+SAMSUN_TEST_PATH = Path("dataset/samsun/test.csv")
+PREDICTION_OUTPUT = Path("predictions.csv")
+MAX_GENERATION_LEN = MAX_TARGET_LEN
+TRAIN_EPOCHS = 30
+TRAIN_BATCH_SIZE = 400
+GLOBAL_SEED = 42
+NUM_WORKERS = 4
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -30,6 +43,7 @@ class SquadSeq2SeqDataset(Dataset):
         tokenizer: PreTrainedTokenizerBase,
         max_source_len: int = 384,
         max_target_len: int = 64,
+        require_target: bool = True,
     ) -> None:
         if not path.exists():
             raise FileNotFoundError(f"Dataset not found: {path}")
@@ -37,6 +51,7 @@ class SquadSeq2SeqDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_source_len = max_source_len
         self.max_target_len = max_target_len
+        self.require_target = require_target
         self.bos_token = SOS
         self.eos_token = EOS
         suffix = path.suffix.lower()
@@ -57,9 +72,12 @@ class SquadSeq2SeqDataset(Dataset):
                 primary_keys=("summary", "tldr"),
                 instance_keys=("summary", "tldr"),
             )
-            if not context or not summary:
+            if not context or (self.require_target and not summary):
                 continue
-            self.samples.append({"context": context, "summary": summary})
+            identifier = self._extract_id(rec)
+            if not identifier:
+                identifier = f"sample_{len(self.samples)}"
+            self.samples.append({"context": context, "summary": summary, "id": identifier})
         if not self.samples:
             raise ValueError(f"No data found in {path}")
 
@@ -97,62 +115,114 @@ class SquadSeq2SeqDataset(Dataset):
                     return normalized
         return ""
 
+    @staticmethod
+    def _extract_id(record: Dict[str, Any]) -> str:
+        candidate_keys = ("id", "url", "permalink")
+        for key in candidate_keys:
+            value = record.get(key)
+            if isinstance(value, str) and value.strip():
+                value = value.strip()
+                if key == "permalink" and value.startswith("/"):
+                    return f"https://www.reddit.com{value}"
+                return value
+        instance = record.get("instance")
+        if isinstance(instance, dict):
+            url = instance.get("url") or instance.get("permalink")
+            if isinstance(url, str) and url.strip():
+                url = url.strip()
+                if url.startswith("/"):
+                    return f"https://www.reddit.com{url}"
+                return url
+        return ""
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         example = self.samples[idx]
         source_text = example["context"]
-        target_text = example["summary"]
+        target_text = example.get("summary", "")
         source_tokens = self.tokenizer.encode(
             source_text,
             add_special_tokens=True,
             truncation=True,
             max_length=self.max_source_len
         )
-        target_tokens = self.tokenizer.encode(
-            target_text,
-            add_special_tokens=True,
-            truncation=True,
-            max_length=self.max_target_len
-        )
-        
+        if not self.require_target:
+            target_tokens = None
+        else:
+            target_tokens = self.tokenizer.encode(
+                target_text,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=self.max_target_len
+            )
         return {
+            "id": example["id"],
             "input_ids": source_tokens,
             "labels": target_tokens
         }
 
-class QACollator:
-    def __call__(self, batch: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
-        if not batch:
-            raise ValueError("Empty batch provided to collator.")
-        src_tokens: List[int] = []
-        tgt_tokens: List[int] = []
-        src_lens: List[int] = []
-        tgt_lens: List[int] = []
 
-        for item in batch:
-            src_seq = item["input_ids"]
-            tgt_seq = item["labels"]
-            if not src_seq or not tgt_seq:
-                continue
-            src_lens.append(len(src_seq))
-            tgt_lens.append(len(tgt_seq))
-            src_tokens.extend(src_seq)
-            tgt_tokens.extend(tgt_seq)
+def QACollator(batch: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
+    if not batch:
+        raise ValueError("Empty batch provided to collator.")
+    src_tokens: List[int] = []
+    tgt_tokens: List[int] = []
+    src_lens: List[int] = []
+    tgt_lens: List[int] = []
 
-        if not src_tokens or not tgt_tokens:
-            raise ValueError("Batch contains no valid sequences for packing.")
+    for item in batch:
+        src_seq = item["input_ids"]
+        tgt_seq = item["labels"]
+        if not src_seq or not tgt_seq:
+            continue
+        src_lens.append(len(src_seq))
+        tgt_lens.append(len(tgt_seq))
+        src_tokens.extend(src_seq)
+        tgt_tokens.extend(tgt_seq)
 
-        return {
-            "src": torch.tensor(src_tokens, dtype=torch.long),
-            "tgt": torch.tensor(tgt_tokens, dtype=torch.long),
-            "src_len": torch.tensor(src_lens, dtype=torch.int32),
-            "tgt_len": torch.tensor(tgt_lens, dtype=torch.int32),
-        }
+    if not src_tokens or not tgt_tokens:
+        raise ValueError("Batch contains no valid sequences for packing.")
+
+    return {
+        "src": torch.tensor(src_tokens, dtype=torch.long),
+        "tgt": torch.tensor(tgt_tokens, dtype=torch.long),
+        "src_len": torch.tensor(src_lens, dtype=torch.int32),
+        "tgt_len": torch.tensor(tgt_lens, dtype=torch.int32),
+    }
+
+def GenerateCollator(batch: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
+    if not batch:
+        raise ValueError("Empty batch provided to collator.")
+    src_tokens: List[int] = []
+    src_lens: List[int] = []
+    max_length = 0
+    for item in batch:
+        src_seq = item["input_ids"]
+        max_length = max(max_length, len(src_seq))
+        src_lens.append(len(src_seq))
+        src_tokens.append(src_seq)
+    src_padded = []
+    for seq in src_tokens:
+        padded_seq = seq + [PAD_ID] * (max_length - len(seq))
+        src_padded.append(padded_seq)
+    return {
+        "src": torch.tensor(src_padded, dtype=torch.long),
+        "src_len": torch.tensor(src_lens, dtype=torch.int32),
+    }
+
+def write_predictions_csv(path: Path, predictions: List[Tuple[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["id", "summary"])
+        writer.writerows(predictions)
         
-def build_dataset(path:List[Optional[str]],
+def build_dataset(
+    path: List[Optional[str]],
     tokenizer: PreTrainedTokenizerBase,
+    require_target: bool = True,
 ) -> Optional[Dataset]:
     if all(p is None for p in path):
         return None
@@ -160,32 +230,26 @@ def build_dataset(path:List[Optional[str]],
     for p in path:
         if p is not None:
             dataset = SquadSeq2SeqDataset(
-                Path(p), tokenizer, max_source_len=MAX_SOURCE_LEN, max_target_len=MAX_TARGET_LEN
+                Path(p), tokenizer, max_source_len=MAX_SOURCE_LEN, max_target_len=MAX_TARGET_LEN, require_target=require_target
             )
             datasets.append(dataset)
     print(f"Built dataset with {sum(len(ds) for ds in datasets)} samples.")
     if len(datasets) == 1:
         return datasets[0]
     return ConcatDataset(datasets)
-    
+
 def build_dataloader(
     source: Union[Optional[Dataset], Optional[str]],
-    tokenizer: PreTrainedTokenizerBase,
-    max_source_len: int = 384,
-    max_target_len: int = 64,
     batch_size: int = 4,
     shuffle: bool = False,
-    num_workers: int = 0,
+    num_workers: int = 8,
+    generation: bool = False,
 ) -> Optional[DataLoader]:
-    if source is None:
-        return None
-    if isinstance(source, Dataset):
-        dataset = source
+    dataset = source
+    if generation:
+        collator = GenerateCollator()
     else:
-        dataset = SquadSeq2SeqDataset(
-            Path(source), tokenizer, max_source_len=max_source_len, max_target_len=max_target_len
-        )
-    collator = QACollator()
+        collator = QACollator()
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -258,21 +322,38 @@ def load_checkpoint(
     state = torch.load(path, map_location=device)
     model.load_state_dict(state["model_state_dict"])
 
+def save_checkpoint(
+    model: Seq2SeqModelWithFlashAttn,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[object],
+    path: Path,
+    epoch: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if scheduler is not None and hasattr(scheduler, "state_dict"):
+        state["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(state, path)
+
 
 def main() -> None:
     ### Hyperparameters and arguments ###
-    lr = 5e-5
+    lr = 1e-4
     weight_decay = 0.01
     warmup_steps = 500
-    epochs = 10
+    epochs = TRAIN_EPOCHS
     max_grad_norm = 1.0
-    batch_size = 40
-    num_workers = 4
+    batch_size = TRAIN_BATCH_SIZE
+    num_workers = NUM_WORKERS
     #####################################
-    mode = "train"
-    set_seed(42)
+    mode = MODE
+    set_seed(GLOBAL_SEED)
     if torch.cuda.is_available():
-        device = torch.device("cuda")
+        device = torch.device("cuda:1")
     else:
         raise RuntimeError("CUDA is required to run this code.")
     
@@ -287,9 +368,8 @@ def main() -> None:
         freeze_encoder=True,
     ).to(device)
     tokenizer = model.tokenizer
-    checkpoint_path = None
-    if checkpoint_path is not None and checkpoint_path.exists():
-        load_checkpoint(model, checkpoint_path, device)
+    checkpoint_path = CHECKPOINT_PATH
+    best_checkpoint_path = BEST_CHECKPOINT_PATH
 
     if mode == "train":
         train_set = build_dataset(
@@ -324,6 +404,7 @@ def main() -> None:
             num_training_steps=total_steps,
         )
 
+        best_val_ppl = float("inf")
         for epoch in range(1, epochs + 1):
             train_loss = run_epoch(
                 train_loader,
@@ -336,24 +417,65 @@ def main() -> None:
                 train=True,
             )
             msg = f"Epoch {epoch}/{epochs} - train loss: {train_loss:.4f}"
-            if valid_loader is not None:
-                with torch.no_grad():
-                    val_loss = run_epoch(
-                        valid_loader,
-                        model,
-                        device,
-                        optimizer=None,
-                        scheduler=None,
-                        pad_id=tokenizer.pad_token_id,
-                        max_grad_norm=max_grad_norm,
-                        train=False,
-                    )
-                perplexity = math.exp(min(20, val_loss))
-                msg += f" | val loss: {val_loss:.4f} | ppl: {perplexity:.2f}"
+            current_val_ppl = None
+            with torch.no_grad():
+                val_loss = run_epoch(
+                    valid_loader,
+                    model,
+                    device,
+                    optimizer=None,
+                    scheduler=None,
+                    pad_id=tokenizer.pad_token_id,
+                    max_grad_norm=max_grad_norm,
+                    train=False,
+                )
+            perplexity = math.exp(min(20, val_loss))
+            current_val_ppl = perplexity
+            msg += f" | val loss: {val_loss:.4f} | ppl: {perplexity:.2f}"
             print(msg)
-    else:
-        raise NotImplementedError("Only training mode is implemented.")
-
+            if checkpoint_path is not None:
+                save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    path=checkpoint_path,
+                    epoch=epoch,
+                )
+            if (
+                current_val_ppl is not None
+                and current_val_ppl < best_val_ppl
+                and best_checkpoint_path is not None
+            ):
+                best_val_ppl = current_val_ppl
+                save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    path=best_checkpoint_path,
+                    epoch=epoch,
+                )
+    elif mode == "predict":
+        load_checkpoint(model, BEST_CHECKPOINT_PATH, device)
+        model.eval()
+        test_set = build_dataset(
+            [TIFU_TEST_PATH, SAMSUN_TEST_PATH],
+            tokenizer=model.tokenizer,
+            require_target=False,
+        )
+        predictions: List[Tuple[str, str]] = []
+        with torch.no_grad():
+            for sample in tqdm(test_set, desc="predict", leave=False):
+                summary = model.generate(
+                    torch.tensor(sample["input_ids"]).to(device),
+                    generation_limit=MAX_GENERATION_LEN,
+                    sampling=True,
+                    top_k=50,
+                    top_p=0.9,
+                )
+                predictions.append((sample["id"], summary))
+        output_path = PREDICTION_OUTPUT
+        write_predictions_csv(output_path, predictions)
+        print(f"Wrote {len(predictions)} predictions to {output_path}")
 
 if __name__ == "__main__":
     main()
