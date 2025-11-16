@@ -13,7 +13,8 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformer.Const import *
 from transformer.Models import Seq2SeqModelWithFlashAttn
 from datasets import load_dataset
-
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -131,7 +132,7 @@ class QACollator:
 
         for item in batch:
             src_seq = item["input_ids"]
-            tgt_seq = item["target_ids"]
+            tgt_seq = item["labels"]
             if not src_seq or not tgt_seq:
                 continue
             src_lens.append(len(src_seq))
@@ -162,7 +163,6 @@ def build_dataset(path:List[Optional[str]],
             )
             datasets.append(dataset)
     print(f"Built dataset with {sum(len(ds) for ds in datasets)} samples.")
-    print(f"Sample example: {datasets[0][0]}")
     if len(datasets) == 1:
         return datasets[0]
     return ConcatDataset(datasets)
@@ -247,28 +247,6 @@ def run_epoch(
         steps += 1
     return total_loss / max(1, steps)
 
-
-def save_checkpoint(
-    model: Seq2SeqModelWithFlashAttn,
-    path: Path,
-    epoch: int,
-    args: argparse.Namespace,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "config": {
-                "pretrained_model": args.pretrained_model,
-                "max_target_length": args.max_target_length,
-                "freeze_encoder": args.freeze_encoder,
-            },
-        },
-        path,
-    )
-
-
 def load_checkpoint(
     model: Seq2SeqModelWithFlashAttn,
     path: Path,
@@ -279,6 +257,15 @@ def load_checkpoint(
 
 
 def main() -> None:
+    ### Hyperparameters and arguments ###
+    lr = 5e-5
+    weight_decay = 0.01
+    warmup_steps = 500
+    epochs = 3
+    max_grad_norm = 1.0
+    batch_size = 8
+    num_workers = 4
+    #####################################
     mode = "train"
     set_seed(42)
     if torch.cuda.is_available():
@@ -313,28 +300,28 @@ def main() -> None:
             shuffle=True,
             num_workers=4,
         )
-        if train_loader is None:
-            raise ValueError("Training requires --train-path")
+        val_set = build_dataset(
+            ["dataset/tifu/tifu_val.jsonl", "dataset/samsun/validation.csv"],
+            tokenizer=model.tokenizer,
+        )
         valid_loader = build_dataloader(
-            args.valid_path,
+            val_set,
             tokenizer,
-            args.max_source_length,
-            args.max_target_length,
-            args.batch_size,
+            batch_size=8,
             shuffle=False,
-            num_workers=args.num_workers,
+            num_workers=4,
         )
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+            model.parameters(), lr=lr, weight_decay=weight_decay
         )
-        total_steps = args.epochs * len(train_loader)
+        total_steps = epochs * len(train_loader)
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
-            num_warmup_steps=min(args.warmup_steps, total_steps),
+            num_warmup_steps=min(warmup_steps, total_steps),
             num_training_steps=total_steps,
         )
 
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(1, epochs + 1):
             train_loss = run_epoch(
                 train_loader,
                 model,
@@ -342,10 +329,10 @@ def main() -> None:
                 optimizer,
                 scheduler,
                 tokenizer.pad_token_id,
-                args.max_grad_norm,
+                max_grad_norm,
                 train=True,
             )
-            msg = f"Epoch {epoch}/{args.epochs} - train loss: {train_loss:.4f}"
+            msg = f"Epoch {epoch}/{epochs} - train loss: {train_loss:.4f}"
             if valid_loader is not None:
                 with torch.no_grad():
                     val_loss = run_epoch(
@@ -355,42 +342,14 @@ def main() -> None:
                         optimizer=None,
                         scheduler=None,
                         pad_id=tokenizer.pad_token_id,
-                        max_grad_norm=args.max_grad_norm,
+                        max_grad_norm=max_grad_norm,
                         train=False,
                     )
                 perplexity = math.exp(min(20, val_loss))
                 msg += f" | val loss: {val_loss:.4f} | ppl: {perplexity:.2f}"
             print(msg)
-            save_checkpoint(model, checkpoint_path, epoch, args)
-            tokenizer.save_pretrained(checkpoint_path.parent)
     else:
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(
-                f"Checkpoint {checkpoint_path} not found for eval mode."
-            )
-        eval_loader = build_dataloader(
-            args.valid_path,
-            tokenizer,
-            args.max_source_length,
-            args.max_target_length,
-            args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-        )
-        if eval_loader is None:
-            raise ValueError("Evaluation requires --valid-path")
-        with torch.no_grad():
-            val_loss = run_epoch(
-                eval_loader,
-                model,
-                device,
-                optimizer=None,
-                scheduler=None,
-                pad_id=tokenizer.pad_token_id,
-                max_grad_norm=args.max_grad_norm,
-                train=False,
-            )
-        print(f"Eval loss: {val_loss:.4f}, perplexity: {math.exp(min(20, val_loss)):.2f}")
+        raise NotImplementedError("Only training mode is implemented.")
 
 
 if __name__ == "__main__":

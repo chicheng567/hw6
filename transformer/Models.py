@@ -71,6 +71,7 @@ class Decoder(nn.Module):
         else:
             raise NotImplementedError("Only Flash Attention is implemented in this Decoder.")
 from transformers import ModernBertModel, AutoTokenizer
+from transformer.Const import *
 class Seq2SeqModelWithFlashAttn(nn.Module):
     def __init__(self, transformer_model_path="answerdotai/ModernBERT-base", freeze_encoder=True):
         super().__init__()
@@ -86,7 +87,7 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             d_model=768,
             d_inner=768 * 4,
             pad_idx=self.tokenizer.pad_token_id,
-            n_position=70,
+            n_position=MAX_TARGET_LEN,
             dropout=0.1,
             scale_emb=False,
             flash_attn=True)
@@ -104,16 +105,19 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         # src_input and trg_input are assumed to be already tokenized and sequence packed.
         # src_input and trg_input shape should be (total_seq_len, )
         # Encode
+        dummy_mask = torch.tensor(1, device=src_input_ids.device)
+        bsz = src_seq_len.size(0)
         src_cu_seqlens = seqlen2cu_len(src_seq_len)
         max_src_len = src_seq_len.max().item()
         enc_outputs = self.encoder(
             input_ids=src_input_ids,
-            attention_mask=None,
+            attention_mask=dummy_mask,
             cu_seqlens=src_cu_seqlens,
             max_seqlen=max_src_len,
+            batch_size=bsz
         )
-        enc_output = enc_outputs.last_hidden_state # shape: (total_src_seq_len, d_model)
-        # Decode
+        enc_output = enc_outputs["last_hidden_state"] # shape: (total_src_seq_len, d_model)
+        assert enc_output.size(0) == src_input_ids.size(0), (enc_output.size(), src_input_ids.size())
         dec_output, = self.decoder(
             trg_seq=trg_input_ids,
             trg_mask=trg_seq_len,
