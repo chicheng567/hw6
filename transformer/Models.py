@@ -3,18 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from transformer.Layers import DecoderLayer_Flash
-
-def get_pad_mask(seq, pad_idx):
-    return (seq != pad_idx).unsqueeze(-2)
-
-
-def get_subsequent_mask(seq):
-    ''' For masking out the subsequent info. '''
-    sz_b, len_s = seq.size()
-    subsequent_mask = (1 - torch.triu(
-        torch.ones((1, len_s, len_s), device=seq.device), diagonal=1)).bool()
-    return subsequent_mask
-
+from transformer.utils import *
 
 class PositionalEncoding(nn.Module):
 
@@ -45,7 +34,7 @@ class Decoder(nn.Module):
 
     def __init__(
             self, n_trg_vocab, d_word_vec, n_layers, n_head, d_k, d_v,
-            d_model, d_inner, pad_idx, n_position=200, dropout=0.1, scale_emb=False, flash_attn=False):
+            d_model, d_inner, pad_idx, n_position=200, dropout=0.1, scale_emb=False, flash_attn=True):
 
         super().__init__()
 
@@ -114,11 +103,15 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         # src_input and trg_input are assumed to be already tokenized and sequence packed.
         # src_input and trg_input shape should be (total_seq_len, )
         # Encode
+        src_cu_seqlens = seqlen2cu_len(src_seq_len)
+        max_src_len = src_seq_len.max().item()
         enc_outputs = self.encoder(
             input_ids=src_input_ids,
-            attention_mask=(src_input_ids != self.tokenizer.pad_token_id).long()
+            attention_mask=None,
+            cu_seqlens=src_cu_seqlens,
+            max_seqlen=max_src_len,
         )
-        enc_output = enc_outputs.last_hidden_state
+        enc_output = enc_outputs.last_hidden_state # shape: (total_src_seq_len, d_model)
         # Decode
         dec_output, = self.decoder(
             trg_seq=trg_input_ids,

@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch
 from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_func
-
+from transformer.utils import seqlen2cu_len
 class MultiHeadSelfAttention_Flash(nn.Module):
     ''' Multi-Head self Attention module with Flash Attention '''
 
@@ -24,8 +24,7 @@ class MultiHeadSelfAttention_Flash(nn.Module):
         drop_rate = self.dropout_rate if self.training else 0.0
         residual = x
         qkv_packed = self.w_qkv(x).view(-1, 3, self.n_head, self.d_qkv)
-        cu_seqlens_B = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens_B, (1, 0), value=0)
+        cu_seqlens = seqlen2cu_len(seq_lens)
         max_len = seq_lens.max().item()
         # output shape: (total_tokens, n_head, d_qkv)
         output = flash_attn_varlen_qkvpacked_func(qkv_packed, cu_seqlens, max_len, dropout_p=drop_rate, causal=self.causal)
@@ -58,10 +57,8 @@ class MultiHeadCrossAttention_Flash(nn.Module):
         kv = self.w_kv(x_kv).view(-1, 2, self.n_head, self.d_kv)
         k = kv[:,0,:,:]
         v = kv[:,1,:,:]
-        cu_seqlens_B_q = torch.cumsum(seq_lens_q, dim=0, dtype=torch.int32)
-        cu_seqlens_B_kv = torch.cumsum(seq_lens_kv, dim=0, dtype=torch.int32)
-        cu_seqlens_q = F.pad(cu_seqlens_B_q, (1, 0), value=0)
-        cu_seqlens_kv = F.pad(cu_seqlens_B_kv, (1, 0), value=0)
+        cu_seqlens_q = seqlen2cu_len(seq_lens_q)
+        cu_seqlens_kv = seqlen2cu_len(seq_lens_kv)
         max_len_q = seq_lens_q.max().item()
         max_len_kv = seq_lens_kv.max().item()
         # output shape: (total_tokens_q, n_head, d_kv)
