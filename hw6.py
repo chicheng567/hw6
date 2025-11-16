@@ -3,21 +3,17 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset
-from torch.cuda import amp
-from transformers import AutoTokenizer, ModernBertModel, ModernBertConfig, get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-
-from transformer.Models import Decoder, get_pad_mask, get_subsequent_mask
-
-
-SPECIAL_TOKENS = {"bos_token": "[BOS]", "eos_token": "[EOS]"}
+from transformer.special_tokens import *
+from transformer.Models import Seq2SeqModelWithFlashAttn
+from datasets import load_dataset
 
 
 def set_seed(seed: int) -> None:
@@ -25,20 +21,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def build_tokenizer(model_name: str) -> PreTrainedTokenizerBase:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    special_tokens = {}
-    for key, value in SPECIAL_TOKENS.items():
-        if getattr(tokenizer, key, None) is None:
-            special_tokens[key] = value
-    if tokenizer.pad_token is None:
-        special_tokens["pad_token"] = "[PAD]"
-    if special_tokens:
-        tokenizer.add_special_tokens(special_tokens)
-    return tokenizer
-
 
 class SquadSeq2SeqDataset(Dataset):
     def __init__(
@@ -54,21 +36,35 @@ class SquadSeq2SeqDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_source_len = max_source_len
         self.max_target_len = max_target_len
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                answers = record.get("answers", {}).get("text", [])
-                answer = answers[0] if answers else ""
-                self.samples.append(
-                    {
-                        "question": record.get("question", ""),
-                        "context": record.get("context", ""),
-                        "answer": answer,
-                    }
-                )
+        self.bos_token = SOS
+        self.eos_token = EOS
+        ds = load_dataset("json", data_files=str(path), split="train")
+        for rec in ds:
+            answers = []
+            if "answers" in rec and rec["answers"] is not None:
+                a = rec["answers"]
+
+            if isinstance(a, dict):
+                answers = a.get("text", []) or []
+            elif isinstance(a, list):
+                # list of strings or list of dicts
+                if a and isinstance(a[0], dict):
+                    for item in a:
+                        if isinstance(item, dict):
+                            txt = item.get("text", [])
+                        if isinstance(txt, list):
+                            answers.extend(txt)
+                        elif txt:
+                            answers.append(txt)
+                    else:
+                        answers = a
+            answer = answers[0] if answers else ""
+            self.samples.append(
+                {
+                    "question": rec.get("question", "") or "",
+                    "context": rec.get("context", "") or "",
+                    "answer": answer,
+                })
         if not self.samples:
             raise ValueError(f"No data found in {path}")
 
@@ -92,9 +88,9 @@ class SquadSeq2SeqDataset(Dataset):
             max_length=max(2, self.max_target_len) - 2,
         )
         target_ids = (
-            [self.tokenizer.bos_token_id]
+            [self.bos_token_id]
             + target_tokens
-            + [self.tokenizer.eos_token_id]
+            + [self.eos_token_id]
         )
         return {
             "input_ids": encoded["input_ids"],
@@ -135,79 +131,6 @@ class QACollator:
         }
 
 
-class ModernBertDecoderModel(nn.Module):
-    def __init__(
-        self,
-        model_name: str,
-        tokenizer: PreTrainedTokenizerBase,
-        decoder_layers: int,
-        decoder_ffn_dim: int,
-        decoder_dropout: float,
-        max_target_len: int,
-        use_flash_attn: bool,
-    ) -> None:
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.pad_id = tokenizer.pad_token_id
-        self.use_flash_attn = use_flash_attn
-        try:
-            self.encoder = ModernBertModel.from_pretrained(model_name)
-            self.encoder.resize_token_embeddings(len(tokenizer))
-        except OSError:
-            config = ModernBertConfig()
-            self.encoder = ModernBertModel(config)
-            self.encoder.resize_token_embeddings(len(tokenizer))
-        hidden_size = self.encoder.config.hidden_size
-        n_head = self.encoder.config.num_attention_heads
-        head_dim = hidden_size // n_head
-        self.decoder = Decoder(
-            n_trg_vocab=len(tokenizer),
-            d_word_vec=hidden_size,
-            n_layers=decoder_layers,
-            n_head=n_head,
-            d_k=head_dim,
-            d_v=head_dim,
-            d_model=hidden_size,
-            d_inner=decoder_ffn_dim,
-            pad_idx=self.pad_id,
-            n_position=max_target_len + 5,
-            dropout=decoder_dropout,
-            scale_emb=True,
-            use_flash_attn=use_flash_attn,
-        )
-        self.generator = nn.Linear(hidden_size, len(tokenizer), bias=False)
-        with torch.no_grad():
-            encoder_weights = self.encoder.embeddings.tok_embeddings.weight
-            self.decoder.trg_word_emb.weight.copy_(encoder_weights)
-            self.generator.weight.copy_(encoder_weights)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        decoder_input_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        encoder_outputs = self.encoder(
-            input_ids=input_ids, attention_mask=attention_mask
-        )
-        memory = encoder_outputs.last_hidden_state
-        src_mask = get_pad_mask(input_ids, self.pad_id)
-        trg_pad_mask = get_pad_mask(decoder_input_ids, self.pad_id)
-        trg_sub_mask = get_subsequent_mask(decoder_input_ids)
-        if self.use_flash_attn and input_ids.is_cuda:
-            with amp.autocast(device_type="cuda", dtype=torch.float16):
-                dec_output, *_ = self.decoder(
-                    decoder_input_ids, trg_pad_mask, trg_sub_mask, memory, src_mask
-                )
-                logits = self.generator(dec_output)
-        else:
-            dec_output, *_ = self.decoder(
-                decoder_input_ids, trg_pad_mask, trg_sub_mask, memory, src_mask
-            )
-            logits = self.generator(dec_output)
-        return logits.float()
-
-
 def build_dataloader(
     path: Optional[str],
     tokenizer: PreTrainedTokenizerBase,
@@ -234,7 +157,7 @@ def build_dataloader(
 
 def run_epoch(
     dataloader: DataLoader,
-    model: ModernBertDecoderModel,
+    model: Seq2SeqModelWithFlashAttn,
     device: torch.device,
     optimizer: Optional[torch.optim.Optimizer],
     scheduler: Optional[object],
@@ -251,7 +174,14 @@ def run_epoch(
         target_ids = batch["target_ids"].to(device)
         decoder_input_ids = target_ids[:, :-1]
         labels = target_ids[:, 1:]
-        logits = model(input_ids, attention_mask, decoder_input_ids)
+        src_seq_len = attention_mask.sum(dim=1).to(dtype=torch.int32)
+        trg_seq_len = (decoder_input_ids != pad_id).sum(dim=1).to(dtype=torch.int32)
+        logits = model(
+            src_input_ids=input_ids,
+            trg_input_ids=decoder_input_ids,
+            src_seq_len=src_seq_len,
+            trg_seq_len=trg_seq_len,
+        )
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             labels.reshape(-1),
@@ -270,7 +200,7 @@ def run_epoch(
 
 
 def save_checkpoint(
-    model: ModernBertDecoderModel,
+    model: Seq2SeqModelWithFlashAttn,
     path: Path,
     epoch: int,
     args: argparse.Namespace,
@@ -282,11 +212,8 @@ def save_checkpoint(
             "model_state_dict": model.state_dict(),
             "config": {
                 "pretrained_model": args.pretrained_model,
-                "decoder_layers": args.decoder_layers,
-                "decoder_ffn_dim": args.decoder_ffn_dim,
-                "decoder_dropout": args.decoder_dropout,
                 "max_target_length": args.max_target_length,
-                "use_flash_attn": args.use_flash_attn,
+                "freeze_encoder": args.freeze_encoder,
             },
         },
         path,
@@ -294,7 +221,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    model: ModernBertDecoderModel,
+    model: Seq2SeqModelWithFlashAttn,
     path: Path,
     device: torch.device,
 ) -> None:
@@ -315,26 +242,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--max-source-length", type=int, default=384)
     parser.add_argument("--max-target-length", type=int, default=64)
-    parser.add_argument("--decoder-layers", type=int, default=6)
-    parser.add_argument("--decoder-ffn-dim", type=int, default=3072)
-    parser.add_argument("--decoder-dropout", type=float, default=0.1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-path", type=str, default="checkpoints/bert_decoder.pt")
     parser.add_argument(
-        "--use-flash-attn",
-        dest="use_flash_attn",
+        "--freeze-encoder",
+        dest="freeze_encoder",
         action="store_true",
-        help="Force-enable flash attention (default).",
+        help="Freeze ModernBERT encoder weights (default).",
     )
     parser.add_argument(
-        "--no-flash-attn",
-        dest="use_flash_attn",
+        "--no-freeze-encoder",
+        dest="freeze_encoder",
         action="store_false",
-        help="Disable flash attention even if the environment supports it.",
+        help="Allow fine-tuning the encoder.",
     )
-    parser.set_defaults(use_flash_attn=True)
+    parser.set_defaults(freeze_encoder=True)
     parser.add_argument("--device", type=str, default=None, help="Override device string, e.g. cuda:0")
     return parser.parse_args()
 
@@ -342,7 +266,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
-    tokenizer = build_tokenizer(args.pretrained_model)
     if args.device is not None:
         device = torch.device(args.device)
         if device.type != "cuda":
@@ -351,15 +274,11 @@ def main() -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("GPU device is required but not detected. Please run on CUDA hardware.")
         device = torch.device("cuda")
-    model = ModernBertDecoderModel(
-        model_name=args.pretrained_model,
-        tokenizer=tokenizer,
-        decoder_layers=args.decoder_layers,
-        decoder_ffn_dim=args.decoder_ffn_dim,
-        decoder_dropout=args.decoder_dropout,
-        max_target_len=args.max_target_length,
-        use_flash_attn=args.use_flash_attn,
+    model = Seq2SeqModelWithFlashAttn(
+        transformer_model_path=args.pretrained_model,
+        freeze_encoder=args.freeze_encoder,
     ).to(device)
+    tokenizer = model.tokenizer
 
     checkpoint_path = Path(args.checkpoint_path)
     if checkpoint_path.exists():
