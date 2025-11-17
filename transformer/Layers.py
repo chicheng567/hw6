@@ -3,7 +3,6 @@ import torch.nn as nn
 from transformer.SubLayers import PositionwiseFeedForward, MultiHeadCrossAttention_Flash, MultiHeadSelfAttention_Flash
 class DecoderLayer_Flash(nn.Module):
     ''' Compose with three layers using Flash Attention '''
-
     def __init__(self, d_model, d_inner, n_head, d_qkv, dropout=0.1):
         super(DecoderLayer_Flash, self).__init__()
         self.slf_attn = MultiHeadSelfAttention_Flash(n_head, d_model, d_qkv, dropout=dropout, causal=True)
