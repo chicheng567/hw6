@@ -17,7 +17,7 @@ from datasets import load_dataset
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-MODE = "predict"  # set to "predict" for inference
+MODE = "train"  # set to "predict" for inference
 CHECKPOINT_PATH = Path("checkpoints/latest.pt")
 BEST_CHECKPOINT_PATH = Path("checkpoints/best.pt")
 PREDICT_CHECKPOINT = Path("checkpoints/best.pt")
@@ -26,7 +26,7 @@ SAMSUN_TEST_PATH = Path("dataset/samsun/test.csv")
 PREDICTION_OUTPUT = Path("predictions.csv")
 MAX_GENERATION_LEN = MAX_TARGET_LEN
 TRAIN_EPOCHS = 30
-TRAIN_BATCH_SIZE = 400
+TRAIN_BATCH_SIZE = 100
 GLOBAL_SEED = 42
 NUM_WORKERS = 4
 
@@ -328,8 +328,8 @@ def save_checkpoint(
 def main() -> None:
     ### Hyperparameters and arguments ###
     lr = 1e-4
-    weight_decay = 0.01
-    warmup_steps = 500
+    weight_decay = 0.001
+    warmup_steps = 2000
     epochs = TRAIN_EPOCHS
     max_grad_norm = 1.0
     batch_size = TRAIN_BATCH_SIZE
