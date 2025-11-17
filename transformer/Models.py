@@ -3,7 +3,7 @@ from multiprocessing import context
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Optional
+from typing import List, Optional
 from transformer.Layers import DecoderLayer_Flash
 from transformer.utils import *
 from transformer.Const import *
@@ -168,13 +168,14 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         top_k,
         top_p
     ) -> torch.Tensor:
-        # logits: (vocab_size,)
+        # logits: (bsz, vocab_size)
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
         filter_value: float = -float('Inf')
         vocab_size = logits.size(-1)
         if top_k > 0 and top_k < vocab_size:
-            kth_score, indices = torch.topk(logits.unsqueeze(0), top_k)
-            k_th_score = kth_score.squeeze(0)
-            min_kth_score = k_th_score[-1]
+            k_th_score, indices = torch.topk(logits, top_k)
+            min_kth_score = k_th_score[:,-1].view(-1,1)
             logits = torch.where(
                 logits < min_kth_score,
                 torch.full_like(logits, filter_value),
@@ -186,8 +187,8 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             sorted_probabilities, sorted_indices = torch.sort(probabilities, descending=True)
             cumulative_probabilities = torch.cumsum(sorted_probabilities, dim=-1)
             sorted_indices_to_remove = cumulative_probabilities > top_p
-            sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
-            sorted_indices_to_remove[0] = 0
+            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+            sorted_indices_to_remove[:, 0] = 0
             mask = torch.zeros_like(logits, dtype=torch.bool).scatter_(
                 dim=-1, index=sorted_indices, src=sorted_indices_to_remove
             )
@@ -197,23 +198,45 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
     def generate(
         self,
         input_ids: torch.Tensor,
+        src_seq_len: torch.Tensor,
         generation_limit: int,
         sampling: bool = False,
         top_k: int = 10,
         top_p: float = 0.9,
-    ) -> str:
+    ) -> List[str]:
         device = self.output_projection.weight.device
-        tgt = torch.tensor([self.tokenizer.cls_token_id], dtype=torch.long, device=device)
+        src_seq_len = src_seq_len.to(device=device, dtype=torch.int32)
+        bsz = src_seq_len.size(0)
+
+        sequences = [
+            torch.tensor([self.tokenizer.cls_token_id], device=device, dtype=torch.long)
+            for _ in range(bsz)
+        ]
+        finished = torch.zeros(bsz, dtype=torch.bool, device=device)
+
         for _ in range(generation_limit):
-            src_len = torch.tensor([input_ids.size(0)], dtype=torch.long, device=device)
-            tgt_len = torch.tensor([tgt.size(0)], dtype=torch.long, device=device)
+            trg_seq_len = torch.tensor(
+                [seq.numel() for seq in sequences],
+                device=device,
+                dtype=torch.int32,
+            )
+            decoder_input_ids = torch.cat(sequences, dim=0)
             logits = self.forward(
                 src_input_ids=input_ids,
-                trg_input_ids=tgt,
-                src_seq_len=src_len,
-                trg_seq_len=tgt_len,
+                trg_input_ids=decoder_input_ids,
+                src_seq_len=src_seq_len,
+                trg_seq_len=trg_seq_len,
             )
-            next_token_logits = logits[-1, :]
+            trg_seq_len_long = trg_seq_len.to(dtype=torch.long)
+            end_positions = torch.cumsum(trg_seq_len_long, dim=0) - 1
+            next_token_logits = logits[end_positions]
+
+            if finished.any():
+                next_token_logits[finished] = -float("inf")
+                next_token_logits[
+                    finished, self.tokenizer.sep_token_id
+                ] = 0.0  # keep SEP sticky
+
             if sampling:
                 filtered_logits = self.top_k_top_p_filtering(
                     next_token_logits,
@@ -221,13 +244,28 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
                     top_p=top_p,
                 )
                 probabilities = torch.softmax(filtered_logits, dim=-1)
-                next_token = torch.multinomial(probabilities, num_samples=1)
+                next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
             else:
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-            tgt = torch.cat([tgt, next_token], dim=0)
-            if next_token.item() == self.tokenizer.sep_token_id:
+                next_token = torch.argmax(next_token_logits, dim=-1)
+
+            for idx in range(bsz):
+                if finished[idx]:
+                    continue
+                sequences[idx] = torch.cat(
+                    [sequences[idx], next_token[idx].view(1)]
+                )
+                if next_token[idx].item() == self.tokenizer.sep_token_id:
+                    finished[idx] = True
+
+            if bool(torch.all(finished)):
                 break
-        output_text = self.tokenizer.decode(tgt.tolist(), skip_special_tokens=True)
+
+        output_text: List[str] = []
+        for seq in sequences:
+            tokens = seq.tolist()
+            if self.tokenizer.sep_token_id in tokens:
+                tokens = tokens[: tokens.index(self.tokenizer.sep_token_id)]
+            output_text.append(self.tokenizer.decode(tokens, skip_special_tokens=True))
         return output_text
 
     def _cast_modules_to_dtype(self, dtype: Optional[torch.dtype]) -> None:
@@ -238,6 +276,7 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         self.output_projection.to(dtype=dtype)
 
     def _tie_decoder_embeddings(self) -> None:
+        # Initialize decoder embeddings with encoder embeddings and decoder embeddings tie to output projection layer
         with torch.no_grad():
             self.decoder.trg_word_emb.weight.copy_(
                 self.encoder.embeddings.tok_embeddings.weight

@@ -17,10 +17,10 @@ from datasets import load_dataset
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-MODE = "train"  # set to "predict" for inference
+MODE = "predict"  # set to "predict" for inference
 CHECKPOINT_PATH = Path("checkpoints/latest.pt")
 BEST_CHECKPOINT_PATH = Path("checkpoints/best.pt")
-PREDICT_CHECKPOINT = None
+PREDICT_CHECKPOINT = Path("checkpoints/best.pt")
 TIFU_TEST_PATH = Path("dataset/tifu/tifu_test.jsonl")
 SAMSUN_TEST_PATH = Path("dataset/samsun/test.csv")
 PREDICTION_OUTPUT = Path("predictions.csv")
@@ -117,22 +117,35 @@ class SquadSeq2SeqDataset(Dataset):
 
     @staticmethod
     def _extract_id(record: Dict[str, Any]) -> str:
-        candidate_keys = ("id", "url", "permalink")
-        for key in candidate_keys:
-            value = record.get(key)
-            if isinstance(value, str) and value.strip():
+        def _sanitize(value: Optional[str]) -> str:
+            if isinstance(value, str):
                 value = value.strip()
+                if value:
+                    return value
+            return ""
+
+        record_id = _sanitize(record.get("id"))
+        if record_id:
+            return record_id
+
+        for key in ("url", "permalink"):
+            value = _sanitize(record.get(key))
+            if value:
                 if key == "permalink" and value.startswith("/"):
                     return f"https://www.reddit.com{value}"
                 return value
+
         instance = record.get("instance")
         if isinstance(instance, dict):
-            url = instance.get("url") or instance.get("permalink")
-            if isinstance(url, str) and url.strip():
-                url = url.strip()
-                if url.startswith("/"):
-                    return f"https://www.reddit.com{url}"
-                return url
+            inst_id = _sanitize(instance.get("id"))
+            if inst_id:
+                return inst_id
+            for key in ("url", "permalink"):
+                value = _sanitize(instance.get(key))
+                if value:
+                    if key == "permalink" and value.startswith("/"):
+                        return f"https://www.reddit.com{value}"
+                    return value
         return ""
 
     def __len__(self) -> int:
@@ -162,8 +175,7 @@ class SquadSeq2SeqDataset(Dataset):
             "input_ids": source_tokens,
             "labels": target_tokens
         }
-
-
+        
 def QACollator(batch: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
     if not batch:
         raise ValueError("Empty batch provided to collator.")
@@ -171,45 +183,22 @@ def QACollator(batch: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
     tgt_tokens: List[int] = []
     src_lens: List[int] = []
     tgt_lens: List[int] = []
-
+    id_s = []
     for item in batch:
+        id_s.append(item["id"])
         src_seq = item["input_ids"]
-        tgt_seq = item["labels"]
-        if not src_seq or not tgt_seq:
-            continue
         src_lens.append(len(src_seq))
-        tgt_lens.append(len(tgt_seq))
         src_tokens.extend(src_seq)
-        tgt_tokens.extend(tgt_seq)
-
-    if not src_tokens or not tgt_tokens:
-        raise ValueError("Batch contains no valid sequences for packing.")
-
+        tgt_seq = item.get("labels", None)
+        if tgt_seq is not None:
+            tgt_lens.append(len(tgt_seq))
+            tgt_tokens.extend(tgt_seq)
     return {
         "src": torch.tensor(src_tokens, dtype=torch.long),
         "tgt": torch.tensor(tgt_tokens, dtype=torch.long),
         "src_len": torch.tensor(src_lens, dtype=torch.int32),
         "tgt_len": torch.tensor(tgt_lens, dtype=torch.int32),
-    }
-
-def GenerateCollator(batch: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
-    if not batch:
-        raise ValueError("Empty batch provided to collator.")
-    src_tokens: List[int] = []
-    src_lens: List[int] = []
-    max_length = 0
-    for item in batch:
-        src_seq = item["input_ids"]
-        max_length = max(max_length, len(src_seq))
-        src_lens.append(len(src_seq))
-        src_tokens.append(src_seq)
-    src_padded = []
-    for seq in src_tokens:
-        padded_seq = seq + [PAD_ID] * (max_length - len(seq))
-        src_padded.append(padded_seq)
-    return {
-        "src": torch.tensor(src_padded, dtype=torch.long),
-        "src_len": torch.tensor(src_lens, dtype=torch.int32),
+        "id": id_s,
     }
 
 def write_predictions_csv(path: Path, predictions: List[Tuple[str, str]]) -> None:
@@ -243,13 +232,9 @@ def build_dataloader(
     batch_size: int = 4,
     shuffle: bool = False,
     num_workers: int = 8,
-    generation: bool = False,
 ) -> Optional[DataLoader]:
     dataset = source
-    if generation:
-        collator = GenerateCollator()
-    else:
-        collator = QACollator()
+    collator = QACollator
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -378,7 +363,6 @@ def main() -> None:
         )
         train_loader = build_dataloader(
             train_set,
-            tokenizer,
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
@@ -389,7 +373,6 @@ def main() -> None:
         )
         valid_loader = build_dataloader(
             val_set,
-            tokenizer,
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
@@ -455,24 +438,34 @@ def main() -> None:
                     epoch=epoch,
                 )
     elif mode == "predict":
-        load_checkpoint(model, BEST_CHECKPOINT_PATH, device)
+        load_checkpoint(model, PREDICT_CHECKPOINT, device)
         model.eval()
         test_set = build_dataset(
             [TIFU_TEST_PATH, SAMSUN_TEST_PATH],
             tokenizer=model.tokenizer,
             require_target=False,
         )
+        test_loader = build_dataloader(
+            test_set,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+        )
         predictions: List[Tuple[str, str]] = []
         with torch.no_grad():
-            for sample in tqdm(test_set, desc="predict", leave=False):
-                summary = model.generate(
-                    torch.tensor(sample["input_ids"]).to(device),
+            for sample in tqdm(test_loader, desc="predict", leave=False):
+                input_ids = sample["src"].to(device)
+                src_lens = sample["src_len"].to(device=device, dtype=torch.int32)
+                ids = sample["id"] #list of ids
+                summaries = model.generate(
+                    input_ids=input_ids,
+                    src_seq_len=src_lens,
                     generation_limit=MAX_GENERATION_LEN,
                     sampling=True,
                     top_k=50,
                     top_p=0.9,
                 )
-                predictions.append((sample["id"], summary))
+                predictions.extend(zip(ids, summaries))
         output_path = PREDICTION_OUTPUT
         write_predictions_csv(output_path, predictions)
         print(f"Wrote {len(predictions)} predictions to {output_path}")
